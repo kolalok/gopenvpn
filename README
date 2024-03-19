@@ -39,9 +39,9 @@ Installing
 The following libraries are prerequisites:
 
  * glib-2.0
- * gtk+-2.0
- * glade-2.0
- * gnome-keyring (for remembering passphrases)
+ * gtk+-3.0
+ * libsecret (for remembering passphrases)
+ * ayatana-appindicator3
  * polkit-0.96 (or newer)
 
 The following packages are also prerequisites:
@@ -106,9 +106,8 @@ You can launch gopenvpn manually
 up whenever you login to your computer.
 
 Once gopenvpn is loaded, its system tray icon will appear.  The tray
-icon appears RED when no connection is active, YELLOW and blinking
-when a connection is being made, and GREEN when one or more connections
-is active.
+icon appears RED when no connection is active, YELLOW when a connection
+is being made, and GREEN when one or more connections is active.
 
 Right-click on the tray icon to display the gopenvpn context menu.
 The context menu lists all the VPN connections available to connect,

@@ -17,12 +17,12 @@
 #    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 #
 
-AC_PREREQ([2.59])
-AC_INIT([gopenvpn], [0.8], [gopenvpn-users@lists.sourceforge.net])
+AC_PREREQ([2.71])
+AC_INIT([gopenvpn],[0.9],[gopenvpn-users@lists.sourceforge.net])
 AC_CONFIG_AUX_DIR([.])
 dnl AM_INIT_AUTOMAKE([foreign -Wall -Werror])
 AM_INIT_AUTOMAKE([foreign -Wno-portability -Wno-obsolete tar-ustar])
-AM_GNU_GETTEXT_VERSION([0.18.1])
+AM_GNU_GETTEXT_VERSION([0.22])
 AM_GNU_GETTEXT([external])
 
 AC_PROG_CC
@@ -30,11 +30,9 @@ AC_PROG_CPP
 AC_PROG_INSTALL
 
 # Checks for libraries
-AC_TYPE_SIGNAL
 AC_CHECK_FUNCS([socket strrchr])
 
 # Checks for header files.
-AC_HEADER_STDC
 AC_HEADER_SYS_WAIT
 AC_CHECK_HEADERS([arpa/inet.h fcntl.h netdb.h netinet/in.h stdlib.h string.h sys/socket.h sys/time.h unistd.h paths.h])
 
@@ -48,27 +46,23 @@ AC_CHECK_FUNCS([socket strrchr])
 
 # Checks for needed packages (pkg-config)
 PKG_PROG_PKG_CONFIG
-PKG_CHECK_MODULES(GTK, gtk+-2.0)
+PKG_CHECK_MODULES(GTK, gtk+-3.0)
 AC_SUBST(GTK_CFLAGS)
 AC_SUBST(GTK_LIBS)
 
-PKG_CHECK_MODULES(GLADE, libglade-2.0)
-AC_SUBST(GLADE_CFLAGS)
-AC_SUBST(GLADE_LIBS)
+PKG_CHECK_MODULES(LIBSECRET, libsecret-1)
+AC_SUBST(LIBSECRET_CFLAGS)
+AC_SUBST(LIBSECRET_LIBS)
 
-PKG_CHECK_MODULES(GNOME_KEYRING, gnome-keyring-1)
-AC_SUBST(GNOME_KEYRING_CFLAGS)
-AC_SUBST(GNOME_KEYRING_LIBS)
-
-PKG_CHECK_MODULES(X11, x11)
-AC_SUBST(X11_CFLAGS)
-AC_SUBST(X11_LIBS)
+PKG_CHECK_MODULES(APPINDICATOR, ayatana-appindicator3-0.1)
+AC_SUBST(APPINDICATOR_CFLAGS)
+AC_SUBST(APPINDICATOR_LIBS)
 
 PKG_CHECK_MODULES(POLKIT, polkit-gobject-1 >= 0.96)
 
 # Check for PolicyKit pkexec - can be overridden by --with-pkexec
 AC_ARG_WITH([pkexec],
-        AC_HELP_STRING([--with-pkexec=/path/to/pkexec], [Full path to PolicyKit pkexec]))
+        AS_HELP_STRING([--with-pkexec=/path/to/pkexec], [Full path to PolicyKit pkexec]))
 if test "x${with_pkexec}" = x; then
    # Auto-detect path if no explicit path was set
    AC_PATH_PROGS([PKEXEC_BINPATH], [pkexec],, [$PATH])
@@ -90,7 +84,7 @@ AM_CONDITIONAL([INSTALL_GOVPNSTART], [test ! -z $USE_PKEXEC])
 
 # Check for gedit - can be overridden by --with-gedit
 AC_ARG_WITH([gedit],
-        AC_HELP_STRING([--with-gedit=/path/to/gedit], [Full path to gedit]))
+        AS_HELP_STRING([--with-gedit=/path/to/gedit], [Full path to gedit]))
 if test "x${with_gedit}" = x; then
    # Auto-detect path if no explicit path was set
    AC_PATH_PROGS([GEDIT_BINPATH], [gedit],, [$PATH])
@@ -106,7 +100,7 @@ AC_DEFINE_UNQUOTED([GEDIT_BINARY_PATH], ["$GEDIT_BINPATH"], [Path to gedit])
 
 # Check for openvpn - can be overridden by --with-openvpn
 AC_ARG_WITH([openvpn],
-        AC_HELP_STRING([--with-openvpn=/path/to/openvpn], [Full path to openvpn]))
+        AS_HELP_STRING([--with-openvpn=/path/to/openvpn], [Full path to openvpn]))
 if test "x${with_openvpn}" = x; then
    # Auto-detect path if no explicit path was set
    AC_PATH_PROGS([OPENVPN_BINPATH], [openvpn],, [$PATH])
@@ -123,6 +117,7 @@ AC_DEFINE_UNQUOTED([OPENVPN_BINARY_PATH], ["$OPENVPN_BINPATH"], [Path to OpenVPN
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_SRCDIR([src/gopenvpn.h])
 AC_CONFIG_FILES([pixmaps/Makefile
+                 ui/Makefile
                  po/Makefile.in
                  polkit/Makefile
                  src/Makefile

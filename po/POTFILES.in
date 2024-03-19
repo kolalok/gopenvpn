@@ -1,3 +1,4 @@
 src/gopenvpn.c
-src/eggtrayicon.c
-src/gopenvpn.glade
+ui/auth_dialog.ui
+ui/passphrase_dialog.ui
+ui/details_dialog.ui

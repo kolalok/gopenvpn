@@ -1,4 +1,4 @@
-SUBDIRS = src po pixmaps polkit
+SUBDIRS = src po pixmaps polkit ui
 
 ACLOCAL_AMFLAGS = -I m4
 

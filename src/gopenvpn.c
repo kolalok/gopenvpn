@@ -44,10 +44,10 @@
 #include <glib.h>
 #include <glib/gi18n.h>
 #include <glib/gstdio.h>
-#include <gdk/gdkx.h>
 #include <gtk/gtk.h>
-#include <glade/glade.h>
-#include <gnome-keyring.h>
+#include <libsecret/secret.h>
+#include <libayatana-appindicator/app-indicator.h>
+
 
 #include "gettext.h"
 #include "gopenvpn.h"
@@ -68,19 +68,6 @@
 
 /* Section name based on the connection name */
 #define CONNSECTIONFMT "conn_%s"
-
-/*
- * If GtkStatusIcon is available (Gtk+ 2.10 and later), use it.  Otherwise, use
- * EggTrayIcon.
- */
-
-#ifdef GTK_TYPE_STATUS_ICON
-#define USE_GTKSTATUSICON
-#endif
-
-#ifndef USE_GTKSTATUSICON
-#include "eggtrayicon.h"
-#endif
 
 /*
  * VPNConfig Section
@@ -134,12 +121,13 @@ struct VPNApplet
 	int            configs_count;
 	GtkWidget     *menu;
 	GtkWidget     *count_item;
-	GladeXML      *details_xml;
+	GtkBuilder    *details_xml;
 	gboolean       connecting;
-	char          *glade_file;
+	char          *auth_dialog_ui;
+	char          *passphrase_dialog_ui;
+	char          *details_dialog_ui;
 	char          *closed_image;
 	char          *connecting_image;	
-	char          *blink_image;
 	char          *open_image;
 	int            last_details_page;
 	gboolean       in_modal;
@@ -148,16 +136,7 @@ struct VPNApplet
 	GKeyFile      *state;
 	GHashTable    *configs_table;
 	gboolean       batchmode;
-
-#ifdef USE_GTKSTATUSICON
-	GtkStatusIcon *status_icon;
-#else
-	EggTrayIcon   *tray_icon;
-	GtkWidget     *tray_image;
-	GtkWidget     *event_box;
-	gboolean       icon_blinking;
-	gboolean       blink_on;
-#endif
+	AppIndicator *app_indicator;
 
 	/* these are used in batch mode */
 	char          *homedir;
@@ -195,77 +174,88 @@ VPNApplet *g_applet = NULL;
  * GNOME keyring support
  */
 
+const SecretSchema * govpn_get_schema (void) G_GNUC_CONST;
+#define GOVPN_SEC_SCHEMA govpn_get_schema ()
+
+const SecretSchema *
+govpn_get_schema (void)
+{
+	static const SecretSchema the_schema = {
+	    "net.openvpn.gui.gopenvpn.Password", SECRET_SCHEMA_NONE,
+	    {
+	        {  "config_name", SECRET_SCHEMA_ATTRIBUTE_STRING },
+	        {  "NULL", 0 },
+	    }
+	};
+	return &the_schema;
+}
+
 gboolean get_keyring(const char *config_name,
 					 char **username,
 					 char **passphrase)
 {
-	GnomeKeyringResult ret;
-	GList* found_list = NULL;
-	GnomeKeyringFound *found;
+	GError *error = NULL;
+	gchar *password;
 	char **fields;
 
 	g_return_val_if_fail(config_name != NULL, FALSE);
-	g_return_val_if_fail(passphrase != NULL, FALSE);	
+	g_return_val_if_fail(passphrase != NULL, FALSE);
 
-	ret = gnome_keyring_find_itemsv_sync(GNOME_KEYRING_ITEM_GENERIC_SECRET,
-										 &found_list,
-										 "config_name",
-										 GNOME_KEYRING_ATTRIBUTE_TYPE_STRING,
-										 config_name,
-										 NULL);
-	if (ret != GNOME_KEYRING_RESULT_OK)
+	/* TODO This method may block indefinitely and should not be used in user interface threads. */
+	password = secret_password_lookup_sync (GOVPN_SEC_SCHEMA, NULL, &error,
+												   "config_name", config_name,
+												   NULL);
+
+	if (error != NULL) {
+		syslog(LOG_WARNING, "Error retrieving password: %s\n", error->message);
+		g_error_free (error);
+
 		return FALSE;
+	} else if (password == NULL) {
+		/* no matching password found */
+		return FALSE;
+	} else {
+		fields = g_strsplit(password, ":", 2);
+		secret_password_free (password);
 
-	found = (GnomeKeyringFound*) found_list->data;
+		if (g_strv_length(fields) != 2)
+		{
+			g_strfreev(fields);
+			return FALSE;
+		}
 
-	fields = g_strsplit(found->secret, ":", 2);
-
-	if (g_strv_length(fields) != 2)
-	{
+		if (username)
+			*username = g_strdup(fields[0]);
+		*passphrase = g_strdup(fields[1]);
 		g_strfreev(fields);
-		return FALSE;
+
+		return TRUE;
 	}
-
-	if (username)
-		*username = g_strdup(fields[0]);
-	*passphrase = g_strdup(fields[1]);
-	g_strfreev(fields);
-
-	return TRUE;
 }
 
 void set_keyring(const char *config_name,
 				 const char *username,
 				 const char *passphrase)
 {
-	GnomeKeyringResult ret;
-	GnomeKeyringAttribute attr;
-	GnomeKeyringAttributeList *attributes;
-	guint32 item_id;
+	GError *error = NULL;
 	char *display_name;
 	char *secret;
 
 	display_name = g_strdup_printf(_("Passphrase for OpenVPN connection %s"), config_name);
 	secret = g_strdup_printf("%s:%s", username ? username : "", passphrase);
 
-	attributes = gnome_keyring_attribute_list_new();
-	attr.name = g_strdup("config_name");
-	attr.type = GNOME_KEYRING_ATTRIBUTE_TYPE_STRING;
-	attr.value.string = g_strdup(config_name);
-	g_array_append_val(attributes, attr);
-
-	ret = gnome_keyring_item_create_sync(NULL,
-										 GNOME_KEYRING_ITEM_GENERIC_SECRET,
-										 display_name,
-										 attributes,
-										 secret,
-										 TRUE,
-										 &item_id);
-
-	g_assert(ret == GNOME_KEYRING_RESULT_OK);
-
-	gnome_keyring_attribute_list_free(attributes);
+	/* TODO This method may block indefinitely and should not be used in user interface threads. */
+	secret_password_store_sync (GOVPN_SEC_SCHEMA, SECRET_COLLECTION_DEFAULT,
+								display_name, secret, NULL, &error,
+								"config_name", config_name,
+								NULL);
 	g_free(display_name);
+	g_free(secret);
+
+	if (error != NULL) {
+		syslog(LOG_WARNING, "Error saving password: %s\n", error->message);
+		g_error_free (error);
+	}
 }
 
 /*
@@ -284,7 +274,8 @@ void socket_printf(GIOChannel *channel,
 	text = g_strdup_vprintf(format, ap);
 	va_end(ap);
 
-	g_io_channel_write(channel, text, strlen(text), &bytes_written);
+	g_io_channel_write_chars(channel, text, strlen(text), &bytes_written, NULL);
+	g_io_channel_flush(channel, NULL);
 
 	g_free(text);
 }
@@ -321,8 +312,6 @@ void set_menuitem_label(GtkWidget *menuitem,
 						...)
 {
 	va_list ap;
-	GList *children;
-	GtkWidget *label;
 	char *text;
 
 	g_return_if_fail(menuitem != NULL);
@@ -333,16 +322,9 @@ void set_menuitem_label(GtkWidget *menuitem,
 	text = g_strdup_vprintf(format, ap);
 	va_end(ap);
 
-	children = gtk_container_get_children(GTK_CONTAINER(menuitem));
-	g_return_if_fail(children != NULL);
-
-	label = children->data;
-	g_return_if_fail(GTK_IS_LABEL(label));
-
-	gtk_label_set_text(GTK_LABEL(label), text);
+	gtk_menu_item_set_label(GTK_MENU_ITEM(menuitem), text);
 
 	g_free(text);
-	g_list_free(children);
 }
 
 gboolean starts_with(const char *string,
@@ -409,7 +391,7 @@ void vpn_config_stop(VPNConfig *self)
 	if (self->channel)
 	{
 		socket_printf(self->channel, "signal SIGTERM\r\n");
-		g_io_channel_close(self->channel);
+		g_io_channel_shutdown(self->channel, TRUE, NULL);
 		g_io_channel_unref(self->channel);
 		self->channel = NULL;
 	}
@@ -647,7 +629,7 @@ void vpn_config_free(VPNConfig *self)
 	}
 	if (self->channel)
 	{
-		g_io_channel_close(self->channel);		
+		g_io_channel_shutdown(self->channel, TRUE, NULL);
 		g_io_channel_unref(self->channel);
 		self->channel = NULL;
 	}
@@ -1009,10 +991,11 @@ VPNApplet *vpn_applet_new()
 	self->count_item        = NULL;
 	self->details_xml       = NULL;
 	self->connecting        = FALSE;
-	self->glade_file        = NULL;
+	self->auth_dialog_ui    = NULL;
+	self->passphrase_dialog_ui = NULL;
+	self->details_dialog_ui = NULL;
 	self->closed_image      = NULL;
 	self->connecting_image  = NULL;	
-	self->blink_image       = NULL;
 	self->open_image        = NULL;
 	self->last_details_page = 0;
 	self->in_modal          = FALSE;
@@ -1020,87 +1003,10 @@ VPNApplet *vpn_applet_new()
 	self->preferences       = NULL;
 	self->configs_table     = NULL;
 	self->batchmode         = FALSE;
-	#ifdef USE_GTKSTATUSICON
-	self->status_icon       = NULL;
-	#else
-	self->tray_icon         = NULL;
-	self->tray_image        = NULL;
-	self->event_box         = NULL;
-	self->icon_blinking     = FALSE;
-	self->blink_on          = FALSE;	
-	#endif
+	self->app_indicator     = NULL;
 
 	return self;
 }
-
-#ifdef USE_GTKSTATUSICON
-gint vpn_applet_popup_menu_cb(GtkStatusIcon *icon,
-							  guint button,
-							  guint activate_time,
-							  gpointer user_data)
-{
-	VPNApplet *applet = (VPNApplet*) user_data;
-
-	if (applet->in_modal)
-		return FALSE;
-	gtk_menu_popup(GTK_MENU(applet->menu), NULL, NULL,
-				   gtk_status_icon_position_menu, applet->status_icon,
-				   button, activate_time);
-	gtk_widget_show_all(applet->menu);
-	return TRUE;
-}
-#endif
-
-#ifndef USE_GTKSTATUSICON
-void vpn_applet_position_menu(GtkMenu *menu,
-							  int *x,
-							  int *y,
-							  gboolean *push_in,
-							  gpointer user_data)
-{
-	/* Adapted from GNOME NetworkManager gnome/applet/applet.c */
-	VPNApplet *applet = (VPNApplet*)user_data;
-
-	int screen_w, screen_h, button_x, button_y, panel_w, panel_h;
-	GtkRequisition requisition;
-	GdkScreen *screen;
-
-	screen = gtk_widget_get_screen(applet->event_box);
-	screen_w = gdk_screen_get_width(screen);
-	screen_h = gdk_screen_get_height(screen);
-
-	gdk_window_get_origin(applet->event_box->window,
-						  &button_x, &button_y);
-	gtk_window_get_size(GTK_WINDOW(gtk_widget_get_toplevel(applet->event_box)),
-						&panel_w, &panel_h);
-
-	*x = button_x;
-
-	/* Check to see if we would be placing the menu off of the end of the screen. */
-	gtk_widget_size_request(GTK_WIDGET(applet->menu), &requisition);
-	if (button_y + panel_h + requisition.height >= screen_h)
-		*y = button_y - requisition.height;
-	else
-		*y = button_y + panel_h;
-
-	*push_in = TRUE;
-}
-
-gboolean vpn_applet_button_press_cb(GtkWidget *widget,
-									GdkEventButton *event,
-									gpointer user_data)
-{
-	VPNApplet *applet = (VPNApplet*)user_data;
-	if (applet->in_modal)
-		return FALSE;
-	gtk_widget_set_state(applet->event_box, GTK_STATE_SELECTED);
-	gtk_menu_popup(GTK_MENU(applet->menu), NULL, NULL,
-				   vpn_applet_position_menu, applet,
-				   event->button, event->time);
-	gtk_widget_show_all(applet->menu);
-	return TRUE;
-}
-#endif
 
 GtkWidget *vpn_applet_create_text(GtkTextBuffer *buffer)
 {
@@ -1137,86 +1043,57 @@ void vpn_applet_show_password_cb(GtkToggleButton *togglebutton,
 							 !gtk_entry_get_visibility(password_entry));
 }
 
-#ifndef USE_GTKSTATUSICON
-gboolean vpn_applet_blink_icon(gpointer user_data)
-{
-	VPNApplet *applet = (VPNApplet*)user_data;
-
-	if (!applet->icon_blinking)
-		return FALSE;
-
-	gtk_image_set_from_file(GTK_IMAGE(applet->tray_image),
-							applet->blink_on ? applet->connecting_image : applet->blink_image);
-
-	applet->blink_on = !applet->blink_on;
-
-	return TRUE;
-}
-#endif
-
 gboolean vpn_applet_get_password(VPNApplet *applet,
 								 const char *name,
 								 char **username,
 								 char **password)
 {
 	GtkWidget *dialog;
+	GdkWindow *window;
 	GtkWidget *username_entry;
 	GtkWidget *show_password;
 	gboolean use_username = (username != NULL);
 	GtkWidget *label;
 	GtkWidget *password_entry;
 	int response;
-	GladeXML *xml;
+	GtkBuilder *xml = NULL;
 	GtkWidget *remember_password;
+	const char *dialog_ui_file;
 	const char *dialog_resource;
 
+	dialog_ui_file = use_username ? applet->auth_dialog_ui : applet->passphrase_dialog_ui;
 	dialog_resource = use_username ? "auth_dialog" : "passphrase_dialog";
 
-	xml = glade_xml_new(applet->glade_file,
-						dialog_resource,
-						NULL);
+	xml = gtk_builder_new_from_file(dialog_ui_file);
 
-	dialog = glade_xml_get_widget(xml, dialog_resource);
+	dialog = GTK_WIDGET (gtk_builder_get_object (xml, dialog_resource));
 
-	label = glade_xml_get_widget(xml, "configuration");
+	label = GTK_WIDGET (gtk_builder_get_object (xml, "configuration"));
 	gtk_label_set_text(GTK_LABEL(label), name);
 
-	password_entry = glade_xml_get_widget(xml, "password_entry");
+	password_entry = GTK_WIDGET (gtk_builder_get_object (xml, "password_entry"));
 
-	show_password = glade_xml_get_widget(xml, "show_password");
+	show_password = GTK_WIDGET (gtk_builder_get_object (xml, "show_password"));
 	g_signal_connect(G_OBJECT(show_password),
 					 "toggled",
-					 GTK_SIGNAL_FUNC(vpn_applet_show_password_cb),
+					 G_CALLBACK(vpn_applet_show_password_cb),
 					 password_entry);
 
-	remember_password = glade_xml_get_widget(xml, "remember_password");
+	remember_password = GTK_WIDGET (gtk_builder_get_object (xml, "remember_password"));
 
 	if (use_username)
-		username_entry = glade_xml_get_widget(xml, "username_entry");
+		username_entry = GTK_WIDGET (gtk_builder_get_object (xml, "username_entry"));
 	else
 		username_entry = NULL;
 
 	gtk_window_set_position(GTK_WINDOW(dialog), GTK_WIN_POS_CENTER_ALWAYS);
 	gtk_widget_realize(dialog);
-	gdk_x11_window_set_user_time(dialog->window, gtk_get_current_event_time());
 	gtk_dialog_set_default_response(GTK_DIALOG(dialog),
 									GTK_RESPONSE_OK);
 
 	gtk_widget_show_all(dialog);
 
-	#ifdef USE_GTKSTATUSICON
-	/* Temporarily turn off blinking status icon while
-	 * in this dialog; it's distracting */
-	if (!applet->batchmode)
-		gtk_status_icon_set_blinking(applet->status_icon, FALSE);
-	#endif
-
 	response = vpn_applet_run_dialog(applet, GTK_DIALOG(dialog));
-
-	#ifdef USE_GTKSTATUSICON	
-	if (!applet->batchmode)
-		gtk_status_icon_set_blinking(applet->status_icon, TRUE);
-	#endif
 
 	if (username)
 		*username = g_strdup(gtk_entry_get_text(GTK_ENTRY(username_entry)));
@@ -1237,48 +1114,20 @@ gboolean vpn_applet_get_password(VPNApplet *applet,
 
 void vpn_applet_set_icon_state(VPNApplet *applet, int state)
 {
-	#ifdef USE_GTKSTATUSICON
 	switch (state)
 	{
 	case INACTIVE:
-		gtk_status_icon_set_blinking(applet->status_icon, FALSE);
-		gtk_status_icon_set_from_file(applet->status_icon, applet->closed_image);
+		app_indicator_set_icon_full(applet->app_indicator, "gopenvpn-closed", "Disconnected");
 		break;
 	case CONNECTING:
 	case RECONNECTING:
 	case SENTSTATE:
-		gtk_status_icon_set_blinking(applet->status_icon, TRUE);
-		gtk_status_icon_set_from_file(applet->status_icon, applet->connecting_image);
+		app_indicator_set_icon_full(applet->app_indicator, "gopenvpn-connecting", "Connecting");
 		break;
 	case CONNECTED:
-		gtk_status_icon_set_blinking(applet->status_icon, FALSE);
-		gtk_status_icon_set_from_file(applet->status_icon, applet->open_image);
+		app_indicator_set_icon_full(applet->app_indicator, "gopenvpn-open", "Connected");
 		break;
 	}
-	#else
-	switch (state)
-	{
-	case INACTIVE:
-		applet->icon_blinking = FALSE;
-		gtk_image_set_from_file(GTK_IMAGE(applet->tray_image), applet->closed_image);
-		break;
-	case CONNECTING:
-	case RECONNECTING:
-	case SENTSTATE:
-		gtk_image_set_from_file(GTK_IMAGE(applet->tray_image), applet->connecting_image);
-		if (!applet->icon_blinking)
-		{
-			applet->icon_blinking = TRUE;
-			applet->blink_on = FALSE;
-			g_timeout_add(500, vpn_applet_blink_icon, applet);
-		}
-		break;
-	case CONNECTED:
-		applet->icon_blinking = FALSE;
-		gtk_image_set_from_file(GTK_IMAGE(applet->tray_image), applet->open_image);
-		break;
-	}
-	#endif
 }
 
 void vpn_applet_update_count_and_icon(VPNApplet *applet)
@@ -1300,7 +1149,7 @@ void vpn_applet_update_count_and_icon(VPNApplet *applet)
 	}
 
 	if (!applet->batchmode)
-		set_menuitem_label(applet->count_item, _("OpenVPN: %d connections active"), count);
+		set_menuitem_label(applet->count_item, ngettext("OpenVPN: %d connection active", "OpenVPN: %d connections active", count), count);
 
 	if (new_connecting)
 	{
@@ -1325,20 +1174,16 @@ void vpn_applet_update_details_dialog(VPNApplet *applet, int page_num)
 		/* Update Details dialog if active */
 		if (page_num == -1)
 		{
-			GtkWidget *notebook = glade_xml_get_widget(applet->details_xml,
-													   "logsNotebook");
+			GtkWidget *notebook = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "logsNotebook"));
 			page_num = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
 		}
 		config = vpn_config_get(applet, page_num);
 		if (config)
 		{
 			gboolean connecting = (config->state != INACTIVE);
-			GtkWidget *connectButton = glade_xml_get_widget(applet->details_xml,
-															"connect");
-			GtkWidget *disconnectButton = glade_xml_get_widget(applet->details_xml,
-															   "disconnect");
-			GtkWidget *auto_connect_button = glade_xml_get_widget(applet->details_xml,
-																  "autoConnect");
+			GtkWidget *connectButton = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "connect"));
+			GtkWidget *disconnectButton = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "disconnect"));
+			GtkWidget *auto_connect_button = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "autoConnect"));
 
 			gtk_widget_set_sensitive(connectButton, !connecting);
 			gtk_widget_set_sensitive(disconnectButton, connecting);
@@ -1351,7 +1196,7 @@ void vpn_applet_update_details_dialog(VPNApplet *applet, int page_num)
 }
 
 void vpn_applet_switch_page_cb(GtkNotebook *notebook,
-							   GtkNotebookPage *page,
+							   GtkWidget *page,
 							   guint page_num,
 							   gpointer user_data)
 {
@@ -1364,7 +1209,7 @@ void vpn_applet_clear_log_cb(GtkButton *button, gpointer user_data)
 {
 	VPNApplet *applet = (VPNApplet*)user_data;
 
-	GtkWidget *notebook = glade_xml_get_widget(applet->details_xml, "logsNotebook");
+	GtkWidget *notebook = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "logsNotebook"));
 
 	int index = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
 
@@ -1378,7 +1223,7 @@ void vpn_applet_connect_button_cb(GtkButton *button, gpointer user_data)
 {
 	VPNApplet *applet = (VPNApplet*)user_data;
 
-	GtkWidget *notebook = glade_xml_get_widget(applet->details_xml, "logsNotebook");
+	GtkWidget *notebook = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "logsNotebook"));
 
 	int index = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
 
@@ -1392,7 +1237,7 @@ void vpn_applet_disconnect_button_cb(GtkButton *button, gpointer user_data)
 {
 	VPNApplet *applet = (VPNApplet*)user_data;
 
-	GtkWidget *notebook = glade_xml_get_widget(applet->details_xml, "logsNotebook");
+	GtkWidget *notebook = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "logsNotebook"));
 
 	int index = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
 
@@ -1406,7 +1251,7 @@ void vpn_applet_edit_config_cb(GtkButton *button, gpointer user_data)
 {
 	VPNApplet *applet = (VPNApplet*)user_data;
 
-	GtkWidget *notebook = glade_xml_get_widget(applet->details_xml, "logsNotebook");
+	GtkWidget *notebook = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "logsNotebook"));
 
 	int index = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
 
@@ -1439,7 +1284,7 @@ void vpn_applet_edit_config_cb(GtkButton *button, gpointer user_data)
 void vpn_applet_auto_connect_button_cb(GtkButton *button, gpointer user_data)
 {
 	VPNApplet *applet = (VPNApplet*)user_data;
-	GtkWidget *notebook = glade_xml_get_widget(applet->details_xml, "logsNotebook");
+	GtkWidget *notebook = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "logsNotebook"));
 	int index;
 	VPNConfig *config;
 
@@ -1467,13 +1312,11 @@ void vpn_applet_details(GtkMenuItem *menuitem,
 	int i, page_num;
 	VPNConfig *config;
 
-	applet->details_xml = glade_xml_new(applet->glade_file,
-										"details_dialog",
-										NULL);
+	applet->details_xml = gtk_builder_new_from_file(applet->details_dialog_ui);
 
-	dialog = glade_xml_get_widget(applet->details_xml, "details_dialog");
+	dialog = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "details_dialog"));
 
-	notebook = glade_xml_get_widget(applet->details_xml, "logsNotebook");
+	notebook = GTK_WIDGET (gtk_builder_get_object(applet->details_xml, "logsNotebook"));
 
 	for (i=0, config=applet->configs; i<applet->configs_count; i++, config++)
 	{
@@ -1490,35 +1333,15 @@ void vpn_applet_details(GtkMenuItem *menuitem,
 	/* Remove the dummy first page */
 	gtk_notebook_remove_page(GTK_NOTEBOOK(notebook), 0);	
 
-	glade_xml_signal_connect_data(applet->details_xml,
-								  "switch_page",
-								  G_CALLBACK(vpn_applet_switch_page_cb),
-								  applet);
-
-	glade_xml_signal_connect_data(applet->details_xml,
-								  "autoConnect",
-								  G_CALLBACK(vpn_applet_auto_connect_button_cb),
-								  applet);
-
-	glade_xml_signal_connect_data(applet->details_xml,
-								  "clearLog",
-								  G_CALLBACK(vpn_applet_clear_log_cb),
-								  applet);
-
-	glade_xml_signal_connect_data(applet->details_xml,
-								  "editConfiguration",
-								  G_CALLBACK(vpn_applet_edit_config_cb),
-								  applet);
-
-	glade_xml_signal_connect_data(applet->details_xml,
-								  "connect",
-								  G_CALLBACK(vpn_applet_connect_button_cb),
-								  applet);
-
-	glade_xml_signal_connect_data(applet->details_xml,
-								  "disconnect",
-								  G_CALLBACK(vpn_applet_disconnect_button_cb),
-								  applet);
+	gtk_builder_add_callback_symbols(applet->details_xml,
+								  "switch_page",	   G_CALLBACK(vpn_applet_switch_page_cb),
+								  "autoConnect",	   G_CALLBACK(vpn_applet_auto_connect_button_cb),
+								  "clearLog",		  G_CALLBACK(vpn_applet_clear_log_cb),
+								  "editConfiguration", G_CALLBACK(vpn_applet_edit_config_cb),
+								  "connect",		   G_CALLBACK(vpn_applet_connect_button_cb),
+								  "disconnect",		G_CALLBACK(vpn_applet_disconnect_button_cb),
+								  NULL);
+	gtk_builder_connect_signals(applet->details_xml, applet);
 
 	gtk_dialog_set_default_response(GTK_DIALOG(dialog),
 									GTK_RESPONSE_CLOSE);
@@ -1534,7 +1357,7 @@ void vpn_applet_details(GtkMenuItem *menuitem,
 	vpn_applet_run_dialog(applet, GTK_DIALOG(dialog));
 
 	/* Remember which page was last looked at */
-	page_num = gtk_notebook_current_page(GTK_NOTEBOOK(notebook));
+	page_num = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
 	if (page_num != applet->last_details_page)
 	{
 		applet->last_details_page = page_num;
@@ -1555,7 +1378,7 @@ void vpn_applet_quit(GtkMenuItem *menuitem,
 void vpn_applet_init_popup_menu(VPNApplet *applet)
 {
 	int i;
-	GtkWidget *details_item, *quit_item;
+	GtkWidget *details_item, *quit_item, *separator;
 	VPNConfig *config;
 
 	applet->menu = gtk_menu_new();
@@ -1563,30 +1386,40 @@ void vpn_applet_init_popup_menu(VPNApplet *applet)
 	applet->count_item = gtk_menu_item_new_with_label(_("OpenVPN: 0 connections active"));
 	gtk_widget_set_sensitive(GTK_WIDGET(applet->count_item), FALSE);
 	gtk_menu_shell_append(GTK_MENU_SHELL(applet->menu), applet->count_item);
-	gtk_menu_shell_append(GTK_MENU_SHELL(applet->menu),
-						  gtk_separator_menu_item_new());
+	gtk_widget_show(applet->count_item);
 
-	for (i=0, config=applet->configs; i<applet->configs_count; i++, config++)
+	separator = gtk_separator_menu_item_new();
+	gtk_menu_shell_append(GTK_MENU_SHELL(applet->menu), separator);
+	gtk_widget_show(separator);
+
+	for (i=0, config=applet->configs; i<applet->configs_count; i++, config++) {
 		gtk_menu_shell_append(GTK_MENU_SHELL(applet->menu),
 							  config->menuitem);
+		gtk_widget_show(config->menuitem);
+	}
 
-	gtk_menu_shell_append(GTK_MENU_SHELL(applet->menu),
-						  gtk_separator_menu_item_new());	
+	separator = gtk_separator_menu_item_new();
+	gtk_menu_shell_append(GTK_MENU_SHELL(applet->menu), separator);
+	gtk_widget_show(separator);
 
 	details_item = gtk_menu_item_new_with_label(_("Details..."));
 
 	g_signal_connect(details_item, "activate",
 					 G_CALLBACK(vpn_applet_details), applet);
+	gtk_widget_show(details_item);
 
 	quit_item = gtk_menu_item_new_with_label(_("Quit"));
 
 	g_signal_connect(quit_item, "activate",
 					 G_CALLBACK(vpn_applet_quit), NULL);
+	gtk_widget_show(quit_item);
 
 	gtk_menu_shell_append(GTK_MENU_SHELL(applet->menu),
 						  details_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(applet->menu),
 						  quit_item);
+
+	app_indicator_set_menu(applet->app_indicator, GTK_MENU (applet->menu));
 }
 
 void vpn_applet_init_configs(VPNApplet *applet)
@@ -1676,33 +1509,12 @@ void vpn_applet_reconnect_to_mgmt(VPNApplet *applet)
 
 void vpn_applet_init_status_icon(VPNApplet *applet)
 {
-	#ifdef USE_GTKSTATUSICON
-	applet->status_icon = gtk_status_icon_new_from_file(applet->closed_image);
+	applet->app_indicator = app_indicator_new ("net.openvpn.gui.gopenvpn", "indicator-messages",
+										  APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
 
-	gtk_status_icon_set_tooltip(applet->status_icon, "gopenvpn");
-	gtk_status_icon_set_visible(applet->status_icon, TRUE);
-
-	g_signal_connect(applet->status_icon, "popup-menu",
-					 G_CALLBACK(vpn_applet_popup_menu_cb),
-					 applet);
-	#else
-	applet->tray_icon = egg_tray_icon_new("gopenvpn");
-
-	applet->event_box = gtk_event_box_new();
-	gtk_container_set_border_width(GTK_CONTAINER(applet->event_box), 0);
-
-	applet->tray_image = gtk_image_new();
-	gtk_container_add(GTK_CONTAINER(applet->event_box), applet->tray_image);
-	gtk_container_add(GTK_CONTAINER(applet->tray_icon), applet->event_box);
-
-	gtk_image_set_from_file(GTK_IMAGE(applet->tray_image), applet->closed_image);
-
-	g_signal_connect(applet->tray_icon, "button_press_event",
-					 G_CALLBACK(vpn_applet_button_press_cb),
-					 applet);
-
-	gtk_widget_show_all(GTK_WIDGET(applet->tray_icon));
-	#endif
+	app_indicator_set_status (applet->app_indicator, APP_INDICATOR_STATUS_ACTIVE);
+	app_indicator_set_icon_theme_path(applet->app_indicator, PIXMAPS_DIR);
+	app_indicator_set_icon_full(applet->app_indicator, "gopenvpn-closed", "Disconnected");
 }
 
 void vpn_applet_destroy(VPNApplet *applet)
@@ -1723,13 +1535,8 @@ void vpn_applet_destroy(VPNApplet *applet)
 	if (applet->batchmode)
 		return;
 
-	#ifdef USE_GTKSTATUSICON
-	if (applet->status_icon)
-		g_object_unref(applet->status_icon);
-	#else
-	if (applet->tray_icon)
-		gtk_widget_destroy(GTK_WIDGET(applet->tray_icon));
-	#endif
+	if (applet->app_indicator)
+		g_object_unref(applet->app_indicator);
 
 	if (applet->menu)
 		gtk_widget_destroy(applet->menu);
@@ -1740,8 +1547,6 @@ void vpn_applet_destroy(VPNApplet *applet)
 		g_free(applet->closed_image);
 	if (applet->connecting_image)
 		g_free(applet->connecting_image);
-	if (applet->blink_image)
-		g_free(applet->blink_image);	
 
 	if (applet->preferences)
 		g_key_file_free(applet->preferences);
@@ -1793,9 +1598,17 @@ void vpn_applet_init_batchmode(VPNApplet *applet)
 void vpn_applet_init_resources(VPNApplet *applet)
 {
 	init_resource(applet,
-				  &applet->glade_file,
-				  GLADE_DIR,
-				  GLADE_FILE);
+				  &applet->auth_dialog_ui,
+				  GTKBUILDER_DIR,
+				  "auth_dialog.ui");
+	init_resource(applet,
+				  &applet->passphrase_dialog_ui,
+				  GTKBUILDER_DIR,
+				  "passphrase_dialog.ui");
+	init_resource(applet,
+				  &applet->details_dialog_ui,
+				  GTKBUILDER_DIR,
+				  "details_dialog.ui");
 	if (applet->batchmode)
 		return;
 	init_resource(applet,
@@ -1810,10 +1623,6 @@ void vpn_applet_init_resources(VPNApplet *applet)
 				  &applet->connecting_image,
 				  PIXMAPS_DIR,
 				  CONNECTING_IMAGE);
-	init_resource(applet,
-				  &applet->blink_image,
-				  PIXMAPS_DIR,
-				  BLINK_IMAGE);
 }
 
 char *get_preferences_path(VPNApplet *applet)
@@ -1928,8 +1737,11 @@ void vpn_applet_update_preferences(VPNApplet *applet)
 
 		g_free(data);
 	}
-	if (applet->batchmode)
-		chown(preferences_path, applet->uid, applet->gid);
+	if (applet->batchmode) {
+		if (chown(preferences_path, applet->uid, applet->gid) == -1) {
+			perror("chown");
+		}
+	}
 
 	g_free(preferences_path);
 }
@@ -1964,8 +1776,11 @@ void vpn_applet_update_state(VPNApplet *applet)
 
 		g_free(data);
 	}
-	if (applet->batchmode)
-		chown(state_path, applet->uid, applet->gid);
+	if (applet->batchmode) {
+		if (chown(state_path, applet->uid, applet->gid) == -1) {
+			perror("chown");
+		}
+	}
 
 	g_free(state_path);
 }
